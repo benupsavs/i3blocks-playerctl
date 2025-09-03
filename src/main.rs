@@ -1,13 +1,16 @@
 use std::{io::{BufReader, self, BufRead}, thread};
 
-use i3blocks_playerctl::Player;
+use envconfig::Envconfig;
+use i3blocks_playerctl::{config::Config, Player};
 
 fn main() {
-    let mut player = Player::new();
+    let config = Config::init_from_env().unwrap_or_default();
+    let mut player = Player::new(config);
     player.subscribe();
     let tx = player.tx();
+    let mut player_for_thread = player;
     let jh = thread::spawn(move || {
-        player.refresh_loop();
+        player_for_thread.refresh_loop();
     });
     let mut r = BufReader::new(io::stdin());
     let mut line = String::new();
@@ -21,12 +24,15 @@ fn main() {
             } else if trimmed == "3" {
                 _ = Player::next();
             }
-
-            if tx.send(0).is_err() {
+            // Manual refresh: send None
+            if tx.send(None).is_err() {
                 break;
             }
         } else {
-            _ = tx.send(-1);
+            // Clear state and refresh
+            if tx.send(None).is_err() {
+                break;
+            }
         }
         line.clear();
     }

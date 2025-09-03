@@ -1,4 +1,10 @@
-use std::{thread::{self, JoinHandle}, sync::{Mutex, mpsc::{Sender, Receiver}, Arc}, process::{Command, Stdio}, io::{BufReader, BufRead, self}};
+use std::{thread::{self, JoinHandle}, sync::mpsc::{Sender, Receiver}, process::{Command, Stdio}, io::{BufReader, BufRead, self}};
+
+use crate::config::Config;
+
+use std::time::{Duration, Instant};
+
+pub mod config;
 
 type PlayStatus = &'static str;
 
@@ -20,95 +26,189 @@ fn status_from(str: &str) -> PlayStatus {
     STATUS_STOPPED
 }
 
-// To avoid additional string copying, have one mutable state, behind a mutex.
-#[derive(Default)]
-struct State {
-    status: PlayStatus,
-    artist: String,
-    title: String,
+#[derive(Default, Clone)]
+pub struct State {
+    pub status: PlayStatus,
+    pub artist: String,
+    pub title: String,
 }
 
 pub struct Player {
-    listener: Mutex<Option<JoinHandle<()>>>,
-    state: Arc<Mutex<State>>,
-    tx: Sender<i8>,
-    rx: Receiver<i8>,
+    listener: Option<JoinHandle<()>>,
+    tx: Sender<Option<State>>,
+    rx: Receiver<Option<State>>,
+    state: State,
+    scroll_pos: usize,
+    scroll_dir: i8, // 1 for forward, -1 for backward
+    scroll_hold: u8, // intervals to hold at the edge
+    config: Config,
 }
 
 impl Player {
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
-            listener: Mutex::new(None),
+            listener: None,
             tx,
             rx,
-            state: Arc::new(Mutex::new(State::default())),
+            state: State::default(),
+            scroll_pos: 0,
+            scroll_dir: 1,
+            scroll_hold: 0,
+            config,
         }
     }
 
     pub fn subscribe(&mut self) {
         let tx = self.tx.clone();
-        let state = self.state.clone();
-        *self.listener.lock().unwrap() = Some(thread::spawn(move || {
+        self.listener = Some(thread::spawn(move || {
             if let Ok(c) = Command::new("playerctl")
                 .args(["metadata", "--format", "{{status}}||{{artist}}||{{title}}", "-F"])
                 .stdout(Stdio::piped())
                 .spawn() {
                     let mut r = BufReader::new(c.stdout.unwrap());
                     let mut line = String::new();
+                    let mut state = State::default();
                     loop {
                         line.clear();
                         if r.read_line(&mut line).is_err() {
                             return;
                         }
-
                         let lt = line.trim_end();
-                        if let Ok(lock) = state.lock().as_deref_mut() {
-                            let update_code: i8 = if lt.is_empty() {
-                                -1
-                            } else {
-                                0
-                            };
-                            if update_code == -1 || Player::parse_update(lt, lock) {
-                                if tx.send(update_code).is_err() {
-                                    return;
-                                }
-                            }
+                        if (lt.is_empty() || Player::parse_update(lt, &mut state))
+                                && tx.send(Some(state.clone())).is_err() {
+                            return;
                         }
                     }
                 }
         }));
     }
 
-    pub fn tx(&self) -> Sender<i8> {
+    pub fn tx(&self) -> Sender<Option<State>> {
         self.tx.clone()
     }
 
     pub fn refresh_loop(&mut self) {
-        while let Ok(update_code) = self.rx.recv() {
-            if let Ok(mut state) = self.state.lock() {
-                if update_code == -1 {
-                    state.title.clear();
-                }
-                if state.title.is_empty() {
+    let window = self.config.display_width;
+    let interval = Duration::from_millis(self.config.scroll_interval_ms as u64);
+    let hold_intervals = if self.config.scroll_hold_intervals > 0 { self.config.scroll_hold_intervals - 1 } else { 0 };
+    let mut last_update = Instant::now();
+    let mut pending_update = false;
+        loop {
+            // Non-blocking check for new state
+            match self.rx.try_recv() {
+                Ok(Some(state)) => {
+                    // If content changed, reset scroll position and hold
+                    let new_display = if !state.artist.is_empty() && !state.title.starts_with(&state.artist) {
+                        format!("{} - {}", state.artist, state.title)
+                    } else {
+                        state.title.clone()
+                    };
+                    let old_display = if !self.state.artist.is_empty() && !self.state.title.starts_with(&self.state.artist) {
+                        format!("{} - {}", self.state.artist, self.state.title)
+                    } else {
+                        self.state.title.clone()
+                    };
+                    let content_changed = new_display != old_display;
+                    self.state = state;
+                    if content_changed {
+                        self.scroll_pos = 0;
+                        self.scroll_dir = 1;
+                        self.scroll_hold = 2;
+                    }
+                    pending_update = true;
+                },
+                Ok(None) => {
+                    // Manual refresh, just redraw
+                    pending_update = true;
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => {},
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+            let timer_due = last_update.elapsed() >= interval;
+            if timer_due || pending_update {
+                if self.state.title.is_empty() {
                     println!();
+                    last_update = Instant::now();
+                    pending_update = false;
+                    thread::sleep(interval);
                     continue;
                 }
-
-                let status_char;
-                if state.status == STATUS_PAUSED {
-                    status_char = CHAR_PAUSED;
-                } else if state.status == STATUS_PLAYING {
-                    status_char = CHAR_PLAYING;
+                let status_char = match self.state.status {
+                    STATUS_PAUSED => CHAR_PAUSED,
+                    STATUS_PLAYING => CHAR_PLAYING,
+                    _ => CHAR_STOPPED,
+                };
+                let display = if !self.state.artist.is_empty() && !self.state.title.starts_with(&self.state.artist) {
+                    format!("{} - {}", self.state.artist, self.state.title)
                 } else {
-                    status_char = CHAR_STOPPED;
-                }
-                if !state.artist.is_empty() && !state.title.starts_with(&state.artist) {
-                    println!("{status_char} {} - {}", state.artist, state.title);
+                    self.state.title.clone()
+                };
+                // Scrolling window logic
+                let len = display.chars().count();
+                if self.state.status != STATUS_PLAYING {
+                    // Not playing: always print the start, cut to window, or full if it fits
+                    if len > window {
+                        let chars: Vec<_> = display.chars().collect();
+                        let window_str: String = chars[0..window].iter().collect();
+                        println!("{status_char} {window_str}");
+                    } else {
+                        println!("{status_char} {display}");
+                    }
+                    // Wait for new data, skip timer
+                    last_update = Instant::now();
+                    pending_update = false;
+                    thread::sleep(interval);
+                    continue;
+                } else if len > window {
+                    // Playing: scroll as before
+                    let chars: Vec<_> = display.chars().collect();
+                    let start = self.scroll_pos;
+                    let end = usize::min(start + window, len);
+                    let window_str: String = chars[start..end].iter().collect();
+                    println!("{status_char} {window_str}");
+                    // Only advance scroll on timer, not on update
+                    if timer_due {
+                        let at_start = self.scroll_pos == 0 && self.scroll_dir == -1;
+                        let at_end = self.scroll_pos + window >= len && self.scroll_dir == 1;
+                        if (at_start || at_end) && self.scroll_hold < hold_intervals as u8 {
+                            self.scroll_hold += 1;
+                        } else {
+                            self.scroll_hold = 0;
+                            if self.scroll_dir > 0 {
+                                if self.scroll_pos + window >= len {
+                                    self.scroll_dir = -1;
+                                    if self.scroll_pos > 0 {
+                                        self.scroll_pos -= 1;
+                                    }
+                                } else {
+                                    self.scroll_pos += 1;
+                                }
+                            } else if self.scroll_pos == 0 {
+                                self.scroll_dir = 1;
+                                if self.scroll_pos + window < len {
+                                    self.scroll_pos += 1;
+                                }
+                            } else {
+                                self.scroll_pos -= 1;
+                            }
+                        }
+                    }
                 } else {
-                    println!("{status_char} {}", state.title);
+                    // Playing and fits: print as normal
+                    println!("{status_char} {display}");
+                    // Wait for new data, skip timer
+                    last_update = Instant::now();
+                    pending_update = false;
+                    thread::sleep(interval);
+                    continue;
                 }
+                if timer_due {
+                    last_update = Instant::now();
+                }
+                pending_update = false;
             }
+            thread::sleep(Duration::from_millis(30));
         }
     }
 
@@ -133,12 +233,10 @@ impl Player {
                     state.artist.push_str(field);
                     dirty = true;
                 }
-            } else if field_num == 3 {
-                if state.title != field {
-                    state.title.clear();
-                    state.title.push_str(field);
-                    dirty = true;
-                }
+            } else if field_num == 3 && state.title != field {
+                state.title.clear();
+                state.title.push_str(field);
+                dirty = true;
             }
         }
 
@@ -166,15 +264,15 @@ impl Player {
         Player::send_player_command("next")
     }
 
-    pub fn clear(&self) {
-        self.state.lock().unwrap().title.clear();
+    pub fn clear(&mut self) {
+        self.state.title.clear();
     }
 
 }
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new()
+        Self::new(Config::default())
     }
 }
 
