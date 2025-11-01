@@ -1,7 +1,7 @@
 use std::{io::{BufReader, self, BufRead}, thread};
 
 use envconfig::Envconfig;
-use i3blocks_playerctl::{config::Config, Player};
+use i3blocks_playerctl::{Player, PlayerEvent, config::Config};
 
 fn main() {
     let config = Config::init_from_env().unwrap_or_default();
@@ -18,11 +18,11 @@ fn main() {
         if l > 1 {
             let trimmed = line.trim_end();
             if trimmed == "2" {
-                _ = Player::toggle_playback();
+                tx.send(Some(PlayerEvent::TogglePlayback)).unwrap();
             } else if trimmed == "1" {
-                _ = Player::previous();
+                tx.send(Some(PlayerEvent::PreviousTrack)).unwrap();
             } else if trimmed == "3" {
-                _ = Player::next();
+                tx.send(Some(PlayerEvent::NextTrack)).unwrap();
             }
             // Manual refresh: send None
             if tx.send(None).is_err() {

@@ -26,8 +26,17 @@ fn status_from(str: &str) -> PlayStatus {
     STATUS_STOPPED
 }
 
+pub enum PlayerEvent {
+    StateUpdate(State),
+    Clear,
+    TogglePlayback,
+    PreviousTrack,
+    NextTrack,
+}
+
 #[derive(Default, Clone)]
 pub struct State {
+    pub player_name: String,
     pub status: PlayStatus,
     pub artist: String,
     pub title: String,
@@ -35,8 +44,8 @@ pub struct State {
 
 pub struct Player {
     listener: Option<JoinHandle<()>>,
-    tx: Sender<Option<State>>,
-    rx: Receiver<Option<State>>,
+    tx: Sender<Option<PlayerEvent>>,
+    rx: Receiver<Option<PlayerEvent>>,
     state: State,
     scroll_pos: usize,
     scroll_dir: i8, // 1 for forward, -1 for backward
@@ -63,7 +72,7 @@ impl Player {
         let tx = self.tx.clone();
         self.listener = Some(thread::spawn(move || {
             if let Ok(c) = Command::new("playerctl")
-                .args(["metadata", "--format", "{{status}}||{{artist}}||{{title}}", "-F"])
+                .args(["metadata", "--format", "{{playerName}}||{{status}}||{{artist}}||{{title}}", "-F"])
                 .stdout(Stdio::piped())
                 .spawn() {
                     let mut r = BufReader::new(c.stdout.unwrap());
@@ -76,7 +85,7 @@ impl Player {
                         }
                         let lt = line.trim_end();
                         if (lt.is_empty() || Player::parse_update(lt, &mut state))
-                                && tx.send(Some(state.clone())).is_err() {
+                                && tx.send(Some(PlayerEvent::StateUpdate(state.clone()))).is_err() {
                             return;
                         }
                     }
@@ -84,7 +93,7 @@ impl Player {
         }));
     }
 
-    pub fn tx(&self) -> Sender<Option<State>> {
+    pub fn tx(&self) -> Sender<Option<PlayerEvent>> {
         self.tx.clone()
     }
 
@@ -97,26 +106,46 @@ impl Player {
         loop {
             // Non-blocking check for new state
             match self.rx.try_recv() {
-                Ok(Some(state)) => {
-                    // If content changed, reset scroll position and hold
-                    let new_display = if !state.artist.is_empty() && !state.title.starts_with(&state.artist) {
-                        format!("{} - {}", state.artist, state.title)
-                    } else {
-                        state.title.clone()
-                    };
-                    let old_display = if !self.state.artist.is_empty() && !self.state.title.starts_with(&self.state.artist) {
-                        format!("{} - {}", self.state.artist, self.state.title)
-                    } else {
-                        self.state.title.clone()
-                    };
-                    let content_changed = new_display != old_display;
-                    self.state = state;
-                    if content_changed {
-                        self.scroll_pos = 0;
-                        self.scroll_dir = 1;
-                        self.scroll_hold = 2;
+                Ok(Some(player_event)) => {
+                    match player_event {
+                        PlayerEvent::StateUpdate(state) => {
+                            // If content changed, reset scroll position and hold
+                            let new_display = if !state.artist.is_empty() && !state.title.starts_with(&state.artist) {
+                                format!("{} - {}", state.artist, state.title)
+                            } else {
+                                state.title.clone()
+                            };
+                            let old_display = if !self.state.artist.is_empty() && !self.state.title.starts_with(&self.state.artist) {
+                                format!("{} - {}", self.state.artist, self.state.title)
+                            } else {
+                                self.state.title.clone()
+                            };
+                            let content_changed = new_display != old_display;
+                            self.state = state;
+                            if content_changed {
+                                self.scroll_pos = 0;
+                                self.scroll_dir = 1;
+                                self.scroll_hold = 2;
+                            }
+                            pending_update = true;
+                        }
+                        PlayerEvent::Clear => self.clear(),
+                        PlayerEvent::TogglePlayback => {
+                            if let Err(e) = self.toggle_playback() {
+                                eprintln!("Error: {}", e);
+                            }
+                        },
+                        PlayerEvent::PreviousTrack => {
+                            if let Err(e) = self.previous_track() {
+                                eprintln!("Error: {}", e);
+                            }
+                        },
+                        PlayerEvent::NextTrack => {
+                            if let Err(e) = self.next_track() {
+                                eprintln!("Error: {}", e);
+                            }
+                        },
                     }
-                    pending_update = true;
                 },
                 Ok(None) => {
                     // Manual refresh, just redraw
@@ -222,18 +251,24 @@ impl Player {
         let mut dirty = false;
         for field in update.trim().split("||") {
             field_num += 1;
-            if field_num == 1 {
+            if field_num == 1 { // player_name
+                if state.player_name != field {
+                    state.player_name.clear();
+                    state.player_name.push_str(field);
+                    dirty = true;
+                }
+            } else if field_num == 2 { // status
                 if state.status != field {
                     state.status = status_from(field);
                     dirty = true;
                 }
-            } else if field_num == 2 {
+            } else if field_num == 3 { // artist
                 if state.artist != field {
                     state.artist.clear();
                     state.artist.push_str(field);
                     dirty = true;
                 }
-            } else if field_num == 3 && state.title != field {
+            } else if field_num == 4 && state.title != field { // title
                 state.title.clear();
                 state.title.push_str(field);
                 dirty = true;
@@ -243,25 +278,28 @@ impl Player {
         dirty
     }
 
-    fn send_player_command(command: &str) -> io::Result<()> {
-        Command::new("playerctl")
-            .arg(command)
-            .stdout(Stdio::piped())
+    fn send_player_command(player_name: &str, command: &str) -> io::Result<()> {
+        let mut c = Command::new("playerctl");
+        c.stdout(Stdio::piped());
+        if !player_name.is_empty() {
+            c.arg("-p").arg(player_name);
+        }
+        c.arg(command)
             .spawn()
             .and_then(|mut r| r.wait())
             .map(|_| ())
     }
 
-    pub fn toggle_playback() -> io::Result<()> {
-        Player::send_player_command("play-pause")
+    pub fn toggle_playback(&mut self) -> io::Result<()> {
+        Player::send_player_command(&self.state.player_name, "play-pause")
     }
 
-    pub fn previous() -> io::Result<()> {
-        Player::send_player_command("previous")
+    pub fn previous_track(&mut self) -> io::Result<()> {
+        Player::send_player_command(&self.state.player_name, "previous")
     }
 
-    pub fn next() -> io::Result<()> {
-        Player::send_player_command("next")
+    pub fn next_track(&mut self) -> io::Result<()> {
+        Player::send_player_command(&self.state.player_name, "next")
     }
 
     pub fn clear(&mut self) {
