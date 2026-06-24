@@ -14,27 +14,26 @@ fn main() {
     });
     let mut r = BufReader::new(io::stdin());
     let mut line = String::new();
-    while let Ok(l) = r.read_line(&mut line) {
-        if l > 1 {
-            let trimmed = line.trim_end();
-            if trimmed == "2" {
-                tx.send(Some(PlayerEvent::TogglePlayback)).unwrap();
-            } else if trimmed == "1" {
-                tx.send(Some(PlayerEvent::PreviousTrack)).unwrap();
-            } else if trimmed == "3" {
-                tx.send(Some(PlayerEvent::NextTrack)).unwrap();
-            }
-            // Manual refresh: send None
-            if tx.send(None).is_err() {
-                break;
-            }
-        } else {
-            // Clear state and refresh
-            if tx.send(None).is_err() {
-                break;
-            }
-        }
+    loop {
         line.clear();
+        // read_line returns Ok(0) at EOF (stdin closed).
+        match r.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            _ => {}
+        }
+        let event = match line.trim_end() {
+            "2" => Some(PlayerEvent::TogglePlayback),
+            "1" => Some(PlayerEvent::PreviousTrack),
+            "3" => Some(PlayerEvent::NextTrack),
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = tx.send(Some(event));
+        }
+        // Manual refresh: send None. If the receiver is gone, stop.
+        if tx.send(None).is_err() {
+            break;
+        }
     }
     _ = jh.join();
 }

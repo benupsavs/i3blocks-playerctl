@@ -6,24 +6,26 @@ use std::time::{Duration, Instant};
 
 pub mod config;
 
-type PlayStatus = &'static str;
-
 const CHAR_PLAYING: char = '\u{23f5}';
 const CHAR_STOPPED: char = '\u{23f9}';
 const CHAR_PAUSED:  char = '\u{23f8}';
 
-const STATUS_PLAYING: PlayStatus = "Playing";
-const STATUS_PAUSED:  PlayStatus = "Paused";
-const STATUS_STOPPED: PlayStatus = "Stopped";
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum PlayStatus {
+    Playing,
+    Paused,
+    #[default]
+    Stopped,
+}
 
-fn status_from(str: &str) -> PlayStatus {
-    if str == STATUS_PLAYING {
-        return STATUS_PLAYING;
-    } else if str == STATUS_PAUSED {
-        return STATUS_PAUSED;
+impl From<&str> for PlayStatus {
+    fn from(s: &str) -> Self {
+        match s {
+            "Playing" => PlayStatus::Playing,
+            "Paused" => PlayStatus::Paused,
+            _ => PlayStatus::Stopped,
+        }
     }
-
-    STATUS_STOPPED
 }
 
 pub enum PlayerEvent {
@@ -42,6 +44,18 @@ pub struct State {
     pub title: String,
 }
 
+impl State {
+    /// The text shown for this state: "artist - title", or just the title
+    /// when there is no artist or the title already begins with the artist.
+    fn display_text(&self) -> String {
+        if !self.artist.is_empty() && !self.title.starts_with(&self.artist) {
+            format!("{} - {}", self.artist, self.title)
+        } else {
+            self.title.clone()
+        }
+    }
+}
+
 pub struct Player {
     listener: Option<JoinHandle<()>>,
     tx: Sender<Option<PlayerEvent>>,
@@ -49,7 +63,7 @@ pub struct Player {
     state: State,
     scroll_pos: usize,
     scroll_dir: i8, // 1 for forward, -1 for backward
-    scroll_hold: u8, // intervals to hold at the edge
+    scroll_hold: usize, // intervals to hold at the edge
     config: Config,
 }
 
@@ -80,12 +94,21 @@ impl Player {
                     let mut state = State::default();
                     loop {
                         line.clear();
-                        if r.read_line(&mut line).is_err() {
-                            return;
+                        // read_line returns Ok(0) at EOF (e.g. playerctl exits).
+                        match r.read_line(&mut line) {
+                            Ok(0) | Err(_) => return,
+                            _ => {}
                         }
                         let lt = line.trim_end();
-                        if (lt.is_empty() || Player::parse_update(lt, &mut state))
-                                && tx.send(Some(PlayerEvent::StateUpdate(state.clone()))).is_err() {
+                        let event = if lt.is_empty() {
+                            // No player: clear rather than re-broadcast stale state.
+                            PlayerEvent::Clear
+                        } else if Player::parse_update(lt, &mut state) {
+                            PlayerEvent::StateUpdate(state.clone())
+                        } else {
+                            continue;
+                        };
+                        if tx.send(Some(event)).is_err() {
                             return;
                         }
                     }
@@ -110,22 +133,12 @@ impl Player {
                     match player_event {
                         PlayerEvent::StateUpdate(state) => {
                             // If content changed, reset scroll position and hold
-                            let new_display = if !state.artist.is_empty() && !state.title.starts_with(&state.artist) {
-                                format!("{} - {}", state.artist, state.title)
-                            } else {
-                                state.title.clone()
-                            };
-                            let old_display = if !self.state.artist.is_empty() && !self.state.title.starts_with(&self.state.artist) {
-                                format!("{} - {}", self.state.artist, self.state.title)
-                            } else {
-                                self.state.title.clone()
-                            };
-                            let content_changed = new_display != old_display;
+                            let content_changed = state.display_text() != self.state.display_text();
                             self.state = state;
                             if content_changed {
                                 self.scroll_pos = 0;
                                 self.scroll_dir = 1;
-                                self.scroll_hold = 2;
+                                self.scroll_hold = 0;
                             }
                             pending_update = true;
                         }
@@ -164,22 +177,17 @@ impl Player {
                     continue;
                 }
                 let status_char = match self.state.status {
-                    STATUS_PAUSED => CHAR_PAUSED,
-                    STATUS_PLAYING => CHAR_PLAYING,
-                    _ => CHAR_STOPPED,
+                    PlayStatus::Paused => CHAR_PAUSED,
+                    PlayStatus::Playing => CHAR_PLAYING,
+                    PlayStatus::Stopped => CHAR_STOPPED,
                 };
-                let display = if !self.state.artist.is_empty() && !self.state.title.starts_with(&self.state.artist) {
-                    format!("{} - {}", self.state.artist, self.state.title)
-                } else {
-                    self.state.title.clone()
-                };
+                let display = self.state.display_text();
                 // Scrolling window logic
                 let len = display.chars().count();
-                if self.state.status != STATUS_PLAYING {
+                if self.state.status != PlayStatus::Playing {
                     // Not playing: always print the start, cut to window, or full if it fits
                     if len > window {
-                        let chars: Vec<_> = display.chars().collect();
-                        let window_str: String = chars[0..window].iter().collect();
+                        let window_str: String = display.chars().take(window).collect();
                         println!("{status_char} {window_str}");
                     } else {
                         println!("{status_char} {display}");
@@ -191,16 +199,13 @@ impl Player {
                     continue;
                 } else if len > window {
                     // Playing: scroll as before
-                    let chars: Vec<_> = display.chars().collect();
-                    let start = self.scroll_pos;
-                    let end = usize::min(start + window, len);
-                    let window_str: String = chars[start..end].iter().collect();
+                    let window_str: String = display.chars().skip(self.scroll_pos).take(window).collect();
                     println!("{status_char} {window_str}");
                     // Only advance scroll on timer, not on update
                     if timer_due {
                         let at_start = self.scroll_pos == 0 && self.scroll_dir == -1;
                         let at_end = self.scroll_pos + window >= len && self.scroll_dir == 1;
-                        if (at_start || at_end) && self.scroll_hold < hold_intervals as u8 {
+                        if (at_start || at_end) && self.scroll_hold < hold_intervals {
                             self.scroll_hold += 1;
                         } else {
                             self.scroll_hold = 0;
@@ -247,31 +252,20 @@ impl Player {
         if update.is_empty() {
             return false;
         }
-        let mut field_num = 0;
         let mut dirty = false;
-        for field in update.trim().split("||") {
-            field_num += 1;
-            if field_num == 1 { // player_name
-                if state.player_name != field {
-                    state.player_name.clear();
-                    state.player_name.push_str(field);
-                    dirty = true;
+        for (i, field) in update.trim().split("||").enumerate() {
+            match i {
+                0 if state.player_name != field => { state.player_name = field.to_owned(); dirty = true; }
+                1 => {
+                    let status = PlayStatus::from(field);
+                    if state.status != status {
+                        state.status = status;
+                        dirty = true;
+                    }
                 }
-            } else if field_num == 2 { // status
-                if state.status != field {
-                    state.status = status_from(field);
-                    dirty = true;
-                }
-            } else if field_num == 3 { // artist
-                if state.artist != field {
-                    state.artist.clear();
-                    state.artist.push_str(field);
-                    dirty = true;
-                }
-            } else if field_num == 4 && state.title != field { // title
-                state.title.clear();
-                state.title.push_str(field);
-                dirty = true;
+                2 if state.artist != field => { state.artist = field.to_owned(); dirty = true; }
+                3 if state.title != field => { state.title = field.to_owned(); dirty = true; }
+                _ => {}
             }
         }
 
@@ -290,15 +284,15 @@ impl Player {
             .map(|_| ())
     }
 
-    pub fn toggle_playback(&mut self) -> io::Result<()> {
+    pub fn toggle_playback(&self) -> io::Result<()> {
         Player::send_player_command(&self.state.player_name, "play-pause")
     }
 
-    pub fn previous_track(&mut self) -> io::Result<()> {
+    pub fn previous_track(&self) -> io::Result<()> {
         Player::send_player_command(&self.state.player_name, "previous")
     }
 
-    pub fn next_track(&mut self) -> io::Result<()> {
+    pub fn next_track(&self) -> io::Result<()> {
         Player::send_player_command(&self.state.player_name, "next")
     }
 
@@ -320,10 +314,10 @@ mod tests {
 
     #[test]
     fn parse_status() {
-        assert_eq!(STATUS_PLAYING, status_from("Playing"));
-        assert_eq!(STATUS_PAUSED,  status_from("Paused"));
-        assert_eq!(STATUS_STOPPED, status_from("Stopped"));
+        assert_eq!(PlayStatus::Playing, PlayStatus::from("Playing"));
+        assert_eq!(PlayStatus::Paused,  PlayStatus::from("Paused"));
+        assert_eq!(PlayStatus::Stopped, PlayStatus::from("Stopped"));
 
-        assert_eq!(STATUS_STOPPED, status_from("Nonexistent"));
+        assert_eq!(PlayStatus::Stopped, PlayStatus::from("Nonexistent"));
     }
 }
