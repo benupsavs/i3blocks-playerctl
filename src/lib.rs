@@ -31,6 +31,7 @@ impl From<&str> for PlayStatus {
 pub enum PlayerEvent {
     StateUpdate(State),
     Clear,
+    Error(String),
     TogglePlayback,
     PreviousTrack,
     NextTrack,
@@ -61,6 +62,7 @@ pub struct Player {
     tx: Sender<Option<PlayerEvent>>,
     rx: Receiver<Option<PlayerEvent>>,
     state: State,
+    error: Option<String>,
     scroll_pos: usize,
     scroll_dir: i8, // 1 for forward, -1 for backward
     scroll_hold: usize, // intervals to hold at the edge
@@ -75,6 +77,7 @@ impl Player {
             tx,
             rx,
             state: State::default(),
+            error: None,
             scroll_pos: 0,
             scroll_dir: 1,
             scroll_hold: 0,
@@ -85,10 +88,16 @@ impl Player {
     pub fn subscribe(&mut self) {
         let tx = self.tx.clone();
         self.listener = Some(thread::spawn(move || {
-            if let Ok(c) = Command::new("playerctl")
+            match Command::new("playerctl")
                 .args(["metadata", "--format", "{{playerName}}||{{status}}||{{artist}}||{{title}}", "-F"])
                 .stdout(Stdio::piped())
                 .spawn() {
+                Err(e) => {
+                    let msg = format!("Error: failed to run playerctl: {}", e);
+                    eprintln!("{}", msg);
+                    let _ = tx.send(Some(PlayerEvent::Error(msg)));
+                }
+                Ok(c) => {
                     let mut r = BufReader::new(c.stdout.unwrap());
                     let mut line = String::new();
                     let mut state = State::default();
@@ -113,6 +122,7 @@ impl Player {
                         }
                     }
                 }
+            }
         }));
     }
 
@@ -143,6 +153,10 @@ impl Player {
                             pending_update = true;
                         }
                         PlayerEvent::Clear => self.clear(),
+                        PlayerEvent::Error(msg) => {
+                            self.error = Some(msg);
+                            pending_update = true;
+                        }
                         PlayerEvent::TogglePlayback => {
                             if let Err(e) = self.toggle_playback() {
                                 eprintln!("Error: {}", e);
@@ -170,7 +184,10 @@ impl Player {
             let timer_due = last_update.elapsed() >= interval;
             if timer_due || pending_update {
                 if self.state.title.is_empty() {
-                    println!();
+                    match &self.error {
+                        Some(msg) => println!("{msg}"),
+                        None => println!(),
+                    }
                     last_update = Instant::now();
                     pending_update = false;
                     thread::sleep(interval);
